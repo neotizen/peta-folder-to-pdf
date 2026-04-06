@@ -12,6 +12,7 @@ from pypdf import PdfReader, PdfWriter
 
 DEFAULT_SPLIT_SIZE_MB = 199.0
 PART_SUFFIX_RE = re.compile(r"-part\d{3}\.pdf$", re.IGNORECASE)
+MB_BYTES = 1_000_000
 
 
 def normalize_prompt_path(raw: str) -> str:
@@ -51,10 +52,24 @@ def estimate_writer_size_bytes(writer: PdfWriter) -> int:
     return bio.tell()
 
 
-def save_writer(writer: PdfWriter, output_pdf: Path) -> None:
+def build_writer_for_range(reader: PdfReader, start_page: int, end_page: int) -> PdfWriter:
+    writer = PdfWriter()
+    for page_number in range(start_page, end_page + 1):
+        writer.add_page(reader.pages[page_number])
+    return writer
+
+
+def estimate_range_size_bytes(reader: PdfReader, start_page: int, end_page: int) -> int:
+    writer = build_writer_for_range(reader, start_page, end_page)
+    return estimate_writer_size_bytes(writer)
+
+
+def save_range_to_pdf(reader: PdfReader, start_page: int, end_page: int, output_pdf: Path) -> int:
     output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    writer = build_writer_for_range(reader, start_page, end_page)
     with output_pdf.open("wb") as file_obj:
         writer.write(file_obj)
+    return output_pdf.stat().st_size
 
 
 def cleanup_existing_parts(source_pdf: Path) -> None:
@@ -85,7 +100,7 @@ def collect_target_pdfs(target: Path, recursive: bool) -> list[Path]:
 
 
 def split_pdf_by_size(source_pdf: Path, max_size_mb: float = DEFAULT_SPLIT_SIZE_MB) -> list[Path]:
-    max_bytes = int(max_size_mb * 1024 * 1024)
+    max_bytes = int(max_size_mb * MB_BYTES)
     original_size = source_pdf.stat().st_size
     if original_size <= max_bytes:
         return []
@@ -97,42 +112,61 @@ def split_pdf_by_size(source_pdf: Path, max_size_mb: float = DEFAULT_SPLIT_SIZE_
     cleanup_existing_parts(source_pdf)
 
     parts: list[Path] = []
-    current_writer = PdfWriter()
+    size_cache: dict[tuple[int, int], int] = {}
+    total_pages = len(reader.pages)
+    start_page = 0
     part_number = 1
 
-    def flush_current() -> None:
-        nonlocal current_writer, part_number
-        if len(current_writer.pages) == 0:
-            return
+    def cached_size(end_page: int) -> int:
+        key = (start_page, end_page)
+        if key not in size_cache:
+            size_cache[key] = estimate_range_size_bytes(reader, start_page, end_page)
+        return size_cache[key]
+
+    while start_page < total_pages:
+        low = start_page
+        high = total_pages - 1
+        best_end = start_page
+        best_size = cached_size(start_page)
+
+        while low <= high:
+            mid = (low + high) // 2
+            size = cached_size(mid)
+            if size <= max_bytes:
+                best_end = mid
+                best_size = size
+                low = mid + 1
+            else:
+                high = mid - 1
+
+        if best_end == start_page and best_size > max_bytes:
+            part_end = start_page
+            part_size = save_range_to_pdf(
+                reader,
+                start_page,
+                part_end,
+                make_part_output_path(source_pdf, part_number),
+            )
+        else:
+            part_end = best_end
+            part_size = save_range_to_pdf(
+                reader,
+                start_page,
+                part_end,
+                make_part_output_path(source_pdf, part_number),
+            )
 
         part_path = make_part_output_path(source_pdf, part_number)
-        part_size = estimate_writer_size_bytes(current_writer)
-        save_writer(current_writer, part_path)
         parts.append(part_path)
         if part_size > max_bytes:
             print(
                 f"WARN\t{source_pdf.name}\t단일 파트가 기준 초과\t"
-                f"{part_path.name}\t{part_size / (1024 * 1024):.2f}MB"
+                f"{part_path.name}\t{part_size / MB_BYTES:.2f}MB"
             )
-        current_writer = PdfWriter()
+
+        start_page = part_end + 1
         part_number += 1
 
-    for page in reader.pages:
-        candidate_writer = PdfWriter()
-        for existing_page in current_writer.pages:
-            candidate_writer.add_page(existing_page)
-        candidate_writer.add_page(page)
-
-        candidate_size = estimate_writer_size_bytes(candidate_writer)
-        if len(current_writer.pages) > 0 and candidate_size > max_bytes:
-            flush_current()
-            current_writer.add_page(page)
-            if estimate_writer_size_bytes(current_writer) > max_bytes:
-                flush_current()
-        else:
-            current_writer = candidate_writer
-
-    flush_current()
     return parts
 
 
@@ -214,14 +248,14 @@ def main() -> int:
                     split_count += 1
                     print(
                         f"SPLIT\t{pdf_path.name}\t"
-                        f"{pdf_path.stat().st_size / (1024 * 1024):.2f}MB\t"
+                        f"{pdf_path.stat().st_size / MB_BYTES:.2f}MB\t"
                         f"{', '.join(part.name for part in parts)}"
                     )
                 else:
                     skipped_count += 1
                     print(
                         f"SKIP\t{pdf_path.name}\t"
-                        f"{pdf_path.stat().st_size / (1024 * 1024):.2f}MB"
+                        f"{pdf_path.stat().st_size / MB_BYTES:.2f}MB"
                     )
             except Exception as exc:  # pragma: no cover - file dependent
                 error_count += 1
