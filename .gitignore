@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+
+venv/
+.venv/
+
+credentials.json
+google_token.json
+
+fonts/MALGUN.TTF
+
+cellus/
+*.log
+
+.DS_Store
