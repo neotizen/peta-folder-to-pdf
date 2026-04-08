@@ -15,7 +15,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, urlparse
 
 from pypdf import PdfReader, PdfWriter
@@ -27,15 +27,25 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
 from split_pdf_by_size import DEFAULT_SPLIT_SIZE_MB, parse_split_size_mb, split_pdf_by_size
 
-try:
+if TYPE_CHECKING:
     from google.auth.transport.requests import AuthorizedSession, Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
+
+try:
+    from google.auth.transport.requests import AuthorizedSession as _AuthorizedSession, Request as _Request
+    from google.oauth2.credentials import Credentials as _Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow as _InstalledAppFlow
 except ImportError:  # pragma: no cover - optional at runtime
-    AuthorizedSession = None
-    Request = None
-    Credentials = None
-    InstalledAppFlow = None
+    _AuthorizedSession = None
+    _Request = None
+    _Credentials = None
+    _InstalledAppFlow = None
+
+AuthorizedSession = cast(Any, _AuthorizedSession)
+Request = cast(Any, _Request)
+Credentials = cast(Any, _Credentials)
+InstalledAppFlow = cast(Any, _InstalledAppFlow)
 
 
 PDF_EXTS = {".pdf"}
@@ -345,9 +355,9 @@ def prompt_split_size_mb(default_mb: float = DEFAULT_SPLIT_SIZE_MB) -> float | N
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="하위 폴더 단위로 문서들을 PDF로 변환하고 하위폴더별/통합 PDF를 생성합니다."
+        description="하위 폴더 단위 또는 단일 파일을 PDF로 변환합니다."
     )
-    parser.add_argument("--root", type=Path, default=None, help="상위 폴더 경로")
+    parser.add_argument("--root", type=Path, default=None, help="상위 폴더 또는 단일 파일 경로")
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -730,6 +740,13 @@ def build_output_name(date_str: str, root_name: str, sub_name: str) -> str:
     return f"{date_str}-{sanitize_filename(root_name)}-{sanitize_filename(sub_name)}.pdf"
 
 
+def build_single_file_output_path(source_path: Path, output_dir: Path) -> Path:
+    output_pdf = output_dir / f"{sanitize_filename(source_path.stem)}.pdf"
+    if output_pdf.resolve() == source_path.resolve():
+        output_pdf = output_dir / f"{sanitize_filename(source_path.stem)}-converted.pdf"
+    return output_pdf
+
+
 def build_temp_pdf_path(work_dir: Path, source_path: Path) -> Path:
     return work_dir / f"{sanitize_filename(source_path.stem)}.pdf"
 
@@ -841,6 +858,33 @@ def build_aggregate_pdf(
     return output_pdf
 
 
+def build_single_file_pdf(
+    source_path: Path,
+    output_dir: Path,
+    google_exporter: GoogleExporter | None,
+) -> Path:
+    if source_path.suffix.lower() not in SUPPORTED_EXTS:
+        raise RuntimeError(f"지원되지 않는 확장자입니다: {source_path.suffix}")
+
+    output_pdf = build_single_file_output_path(source_path, output_dir)
+    source_label = nfc(source_path.name)
+    writer = PdfWriter()
+
+    with tempfile.TemporaryDirectory(prefix="file-to-pdf-") as temp_root:
+        temp_root_path = Path(temp_root)
+        converted_pdf = convert_source_to_pdf(
+            source_path,
+            temp_root_path,
+            google_exporter,
+            source_label=source_label,
+        )
+        append_pdf_to_writer(writer, converted_pdf, source_label=source_label)
+        cleanup_split_artifacts(output_pdf)
+        save_writer(writer, output_pdf)
+
+    return output_pdf
+
+
 def has_google_shortcuts(subfolders: list[Path], output_dir: Path) -> bool:
     for subfolder in subfolders:
         for source_file in collect_supported_files(subfolder, output_dir):
@@ -855,12 +899,14 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path | None, Pa
     if args.root is not None:
         root = args.root.expanduser().resolve()
     elif interactive:
-        root = prompt_path("PDF로 변환할 파일들이 있는 상위폴더 경로", must_exist=True, must_be_dir=True)
+        root = prompt_path("PDF로 변환할 파일들이 있는 상위폴더 또는 파일 경로", must_exist=True)
     else:
         raise RuntimeError("--root 가 필요합니다.")
 
-    if not root.exists() or not root.is_dir():
-        raise RuntimeError(f"상위폴더를 찾을 수 없습니다: {root}")
+    if not root.exists():
+        raise RuntimeError(f"입력 경로를 찾을 수 없습니다: {root}")
+    if not root.is_dir() and not root.is_file():
+        raise RuntimeError(f"폴더 또는 파일 경로를 입력해 주세요: {root}")
 
     default_output = Path.home() / "Documents"
     if args.output_dir is not None:
@@ -965,6 +1011,29 @@ def main() -> int:
                 "SPLIT\t"
                 + ("disabled" if split_size_mb is None else f"{split_size_mb:g}MB")
             )
+
+            if root.is_file():
+                needs_google = root.suffix.lower() in GOOGLE_EXTS
+                google_exporter: GoogleExporter | None = None
+                if needs_google:
+                    credentials_path = maybe_prompt_credentials(credentials_path, interactive, token_path)
+                    google_exporter = GoogleExporter(
+                        credentials_path=credentials_path,
+                        token_path=token_path,
+                        interactive=interactive,
+                    )
+
+                output_pdf = build_single_file_pdf(root, output_dir, google_exporter)
+                split_pdfs = split_pdf_by_size(output_pdf, max_size_mb=split_size_mb) if split_size_mb is not None else []
+                print(f"OK\t{root.name}\t-> {output_pdf.name}")
+                if split_pdfs:
+                    print(
+                        f"SPLIT\t{output_pdf.name}\t"
+                        f"{', '.join(path.name for path in split_pdfs)}"
+                    )
+                print("\nSUMMARY")
+                print(f"FILE\t{root.name}\t-> {output_pdf.name}")
+                return 0
 
             subfolders = collect_immediate_subfolders(root)
             if not subfolders:
