@@ -17,14 +17,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import parse_qs, urlparse
+from xml.sax.saxutils import escape
 
 from pypdf import PdfReader, PdfWriter
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+from reportlab.platypus import Paragraph, Preformatted, SimpleDocTemplate, Spacer, Table, TableStyle
 from split_pdf_by_size import DEFAULT_SPLIT_SIZE_MB, parse_split_size_mb, split_pdf_by_size
 
 if TYPE_CHECKING:
@@ -50,13 +54,14 @@ InstalledAppFlow = cast(Any, _InstalledAppFlow)
 
 PDF_EXTS = {".pdf"}
 TEXT_EXTS = {".txt"}
+MARKDOWN_EXTS = {".md", ".markdown"}
 OFFICE_EXTS = {".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx", ".xlx", ".hwp", ".hwpx"}
 GOOGLE_EXTS = {
     ".gdoc": "document",
     ".gsheet": "spreadsheet",
     ".gslides": "presentation",
 }
-SUPPORTED_EXTS = PDF_EXTS | TEXT_EXTS | OFFICE_EXTS | set(GOOGLE_EXTS)
+SUPPORTED_EXTS = PDF_EXTS | TEXT_EXTS | MARKDOWN_EXTS | OFFICE_EXTS | set(GOOGLE_EXTS)
 
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 EXPORT_MIME_TYPE = "application/pdf"
@@ -64,6 +69,21 @@ EXPORT_MIME_TYPE = "application/pdf"
 BASE_DIR = Path(__file__).resolve().parent
 FONT_PATH = BASE_DIR / "fonts" / "MALGUN.TTF"
 FONT_NAME = "Helvetica"
+MARKDOWN_KO_FONT_NAME = "Helvetica"
+MARKDOWN_EN_FONT_NAME = "Times-Roman"
+MARKDOWN_EN_FONT_BOLD_NAME = "Times-Bold"
+MARKDOWN_EN_FONT_ITALIC_NAME = "Times-Italic"
+MARKDOWN_EN_FONT_BOLDITALIC_NAME = "Times-BoldItalic"
+MARKDOWN_KO_FONT_CANDIDATES = [
+    Path("/System/Library/Fonts/Supplemental/Batang.ttc"),
+    Path("/System/Library/Fonts/Supplemental/AppleMyungjo.ttf"),
+]
+MARKDOWN_EN_FONT_CANDIDATES = {
+    "normal": [Path("/System/Library/Fonts/Supplemental/Times New Roman.ttf")],
+    "bold": [Path("/System/Library/Fonts/Supplemental/Times New Roman Bold.ttf")],
+    "italic": [Path("/System/Library/Fonts/Supplemental/Times New Roman Italic.ttf")],
+    "bold_italic": [Path("/System/Library/Fonts/Supplemental/Times New Roman Bold Italic.ttf")],
+}
 
 PAGE_W, PAGE_H = A4
 MARGIN_LR = 40
@@ -77,12 +97,14 @@ HEADER_GAP = 10
 HEADER_COLOR = colors.HexColor("#808080")
 HEADER_MAX_WIDTH = PAGE_W - (MARGIN_LR * 2)
 CONTENT_TOP_Y = PAGE_H - MARGIN_TOP - HEADER_FONT_SIZE - HEADER_GAP
+MARKDOWN_MARGIN = 2.54 * cm
 
 GOOGLE_DOC_URL_RE = re.compile(r"https://docs\.google\.com/document/d/([A-Za-z0-9_-]+)")
 GOOGLE_SHEET_URL_RE = re.compile(r"https://docs\.google\.com/spreadsheets/d/([A-Za-z0-9_-]+)")
 GOOGLE_SLIDES_URL_RE = re.compile(r"https://docs\.google\.com/presentation/d/([A-Za-z0-9_-]+)")
 RESOURCE_ID_RE = re.compile(r"(document|spreadsheet|presentation):([A-Za-z0-9_-]+)")
 FILE_ID_RE = re.compile(r'"(?:fileId|doc_id|sheet_id|id)"\s*:\s*"([A-Za-z0-9_-]+)"')
+KOREAN_CHAR_RE = re.compile(r"[\u1100-\u11FF\u3130-\u318F\uA960-\uA97F\uAC00-\uD7AF\uD7B0-\uD7FF\u4E00-\u9FFF]")
 
 
 @dataclass
@@ -125,10 +147,45 @@ class TeeStream:
 
 
 def init_font() -> None:
-    global FONT_NAME
+    global FONT_NAME, MARKDOWN_KO_FONT_NAME, MARKDOWN_EN_FONT_NAME
+    global MARKDOWN_EN_FONT_BOLD_NAME, MARKDOWN_EN_FONT_ITALIC_NAME, MARKDOWN_EN_FONT_BOLDITALIC_NAME
     if FONT_PATH.exists():
         pdfmetrics.registerFont(TTFont("MalgunGothic", str(FONT_PATH)))
         FONT_NAME = "MalgunGothic"
+
+    for candidate in MARKDOWN_KO_FONT_CANDIDATES:
+        if candidate.exists():
+            pdfmetrics.registerFont(TTFont("MarkdownKorean", str(candidate)))
+            MARKDOWN_KO_FONT_NAME = "MarkdownKorean"
+            break
+
+    english_aliases = {
+        "normal": ("MarkdownEnglish", "MARKDOWN_EN_FONT_NAME"),
+        "bold": ("MarkdownEnglishBold", "MARKDOWN_EN_FONT_BOLD_NAME"),
+        "italic": ("MarkdownEnglishItalic", "MARKDOWN_EN_FONT_ITALIC_NAME"),
+        "bold_italic": ("MarkdownEnglishBoldItalic", "MARKDOWN_EN_FONT_BOLDITALIC_NAME"),
+    }
+    for key, (alias, _) in english_aliases.items():
+        for candidate in MARKDOWN_EN_FONT_CANDIDATES[key]:
+            if candidate.exists():
+                pdfmetrics.registerFont(TTFont(alias, str(candidate)))
+                if key == "normal":
+                    MARKDOWN_EN_FONT_NAME = alias
+                elif key == "bold":
+                    MARKDOWN_EN_FONT_BOLD_NAME = alias
+                elif key == "italic":
+                    MARKDOWN_EN_FONT_ITALIC_NAME = alias
+                else:
+                    MARKDOWN_EN_FONT_BOLDITALIC_NAME = alias
+                break
+
+    pdfmetrics.registerFontFamily(
+        "MarkdownEnglishFamily",
+        normal=MARKDOWN_EN_FONT_NAME,
+        bold=MARKDOWN_EN_FONT_BOLD_NAME,
+        italic=MARKDOWN_EN_FONT_ITALIC_NAME,
+        boldItalic=MARKDOWN_EN_FONT_BOLDITALIC_NAME,
+    )
 
 
 def nfc(text: str) -> str:
@@ -286,6 +343,341 @@ def render_notice_pdf(output_pdf: Path, title: str, details: str, source_label: 
     return render_text_pdf(body, output_pdf, source_label=source_label)
 
 
+def normalize_markdown_inline(text: str) -> str:
+    value = nfc(text)
+    value = re.sub(
+        r"!\[([^\]]*)\]\(([^)]+)\)",
+        lambda m: f"[이미지: {m.group(1).strip() or 'image'}] ({m.group(2).strip()})",
+        value,
+    )
+    value = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        lambda m: f"{m.group(1).strip()} ({m.group(2).strip()})",
+        value,
+    )
+    value = re.sub(r"`([^`]+)`", lambda m: f"「{m.group(1)}」", value)
+    value = re.sub(r"\*\*(.+?)\*\*", r"\1", value)
+    value = re.sub(r"__(.+?)__", r"\1", value)
+    value = re.sub(r"(?<!\*)\*(?!\s)(.+?)(?<!\s)\*(?!\*)", r"\1", value)
+    value = re.sub(r"(?<!_)_(?!\s)(.+?)(?<!\s)_(?!_)", r"\1", value)
+    value = re.sub(r"~~(.+?)~~", r"\1", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def is_korean_text(text: str) -> bool:
+    return bool(KOREAN_CHAR_RE.search(text))
+
+
+def markdown_font_name_for_text(text: str, bold: bool = False, italic: bool = False) -> str:
+    if is_korean_text(text):
+        return MARKDOWN_KO_FONT_NAME
+    if bold and italic:
+        return MARKDOWN_EN_FONT_BOLDITALIC_NAME
+    if bold:
+        return MARKDOWN_EN_FONT_BOLD_NAME
+    if italic:
+        return MARKDOWN_EN_FONT_ITALIC_NAME
+    return MARKDOWN_EN_FONT_NAME
+
+
+def markdown_font_markup(text: str, bold: bool = False, italic: bool = False) -> str:
+    value = nfc(text)
+    if not value:
+        return ""
+
+    chunks: list[tuple[str, str]] = []
+    current_font = markdown_font_name_for_text(value[0], bold=bold, italic=italic)
+    current_chars = [value[0]]
+
+    for char in value[1:]:
+        font_name = markdown_font_name_for_text(char, bold=bold, italic=italic)
+        if font_name == current_font:
+            current_chars.append(char)
+            continue
+        chunks.append((current_font, "".join(current_chars)))
+        current_font = font_name
+        current_chars = [char]
+    chunks.append((current_font, "".join(current_chars)))
+
+    parts: list[str] = []
+    for font_name, chunk in chunks:
+        parts.append(f'<font name="{font_name}">{escape(chunk)}</font>')
+    return "".join(parts)
+
+
+def markdown_paragraph(text: str, style: ParagraphStyle, bold: bool = False, italic: bool = False) -> Paragraph:
+    return Paragraph(markdown_font_markup(text or " ", bold=bold, italic=italic), style)
+
+
+def build_markdown_styles() -> dict[str, ParagraphStyle]:
+    styles = getSampleStyleSheet()
+    body = ParagraphStyle(
+        "MarkdownBody",
+        parent=styles["BodyText"],
+        fontName=MARKDOWN_KO_FONT_NAME,
+        fontSize=11,
+        leading=16,
+        spaceBefore=0,
+        spaceAfter=8,
+    )
+    return {
+        "body": body,
+        "h1": ParagraphStyle("MarkdownH1", parent=body, fontSize=20, leading=26, spaceBefore=10, spaceAfter=12),
+        "h2": ParagraphStyle("MarkdownH2", parent=body, fontSize=17, leading=23, spaceBefore=10, spaceAfter=10),
+        "h3": ParagraphStyle("MarkdownH3", parent=body, fontSize=15, leading=20, spaceBefore=8, spaceAfter=8),
+        "h4": ParagraphStyle("MarkdownH4", parent=body, fontSize=13, leading=18, spaceBefore=6, spaceAfter=6),
+        "h5": ParagraphStyle("MarkdownH5", parent=body, fontSize=12, leading=17, spaceBefore=6, spaceAfter=6),
+        "h6": ParagraphStyle("MarkdownH6", parent=body, fontSize=11, leading=16, spaceBefore=6, spaceAfter=6),
+        "bullet": ParagraphStyle(
+            "MarkdownBullet",
+            parent=body,
+            leftIndent=16,
+            firstLineIndent=-12,
+            spaceAfter=4,
+        ),
+        "quote": ParagraphStyle(
+            "MarkdownQuote",
+            parent=body,
+            leftIndent=18,
+            rightIndent=12,
+            textColor=colors.HexColor("#555555"),
+            spaceBefore=4,
+            spaceAfter=8,
+        ),
+        "code": ParagraphStyle(
+            "MarkdownCode",
+            parent=body,
+            fontName=MARKDOWN_EN_FONT_NAME,
+            fontSize=9,
+            leading=13,
+            leftIndent=12,
+            rightIndent=12,
+            backColor=colors.HexColor("#F5F5F5"),
+            borderPadding=8,
+            spaceBefore=4,
+            spaceAfter=8,
+        ),
+        "table_header": ParagraphStyle(
+            "MarkdownTableHeader",
+            parent=body,
+            fontSize=10,
+            leading=14,
+            spaceAfter=0,
+        ),
+        "table_cell": ParagraphStyle(
+            "MarkdownTableCell",
+            parent=body,
+            fontSize=10,
+            leading=14,
+            spaceAfter=0,
+        ),
+    }
+
+
+def append_markdown_paragraph(story: list[Any], lines: list[str], style: ParagraphStyle) -> None:
+    text = normalize_markdown_inline(" ".join(line.strip() for line in lines if line.strip()))
+    if text:
+        story.append(markdown_paragraph(text, style))
+    lines.clear()
+
+
+def split_markdown_table_row(line: str) -> list[str]:
+    text = line.strip()
+    if text.startswith("|"):
+        text = text[1:]
+    if text.endswith("|"):
+        text = text[:-1]
+    cells = re.split(r"(?<!\\)\|", text)
+    return [cell.replace(r"\|", "|").strip() for cell in cells]
+
+
+def is_markdown_table_separator_row(cells: list[str]) -> bool:
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell.replace(" ", "")) for cell in cells)
+
+
+def markdown_table_alignments(separator_cells: list[str], column_count: int) -> list[str]:
+    alignments: list[str] = []
+    for index in range(column_count):
+        cell = separator_cells[index].replace(" ", "") if index < len(separator_cells) else "---"
+        if cell.startswith(":") and cell.endswith(":"):
+            alignments.append("CENTER")
+        elif cell.endswith(":"):
+            alignments.append("RIGHT")
+        else:
+            alignments.append("LEFT")
+    return alignments
+
+
+def build_markdown_table(table_lines: list[str], styles: dict[str, ParagraphStyle]) -> Table | None:
+    rows = [split_markdown_table_row(line) for line in table_lines if line.strip()]
+    if not rows:
+        return None
+
+    header_cells = rows[0]
+    data_rows = rows[1:]
+    alignments = ["LEFT"] * len(header_cells)
+
+    if data_rows and is_markdown_table_separator_row(data_rows[0]):
+        alignments = markdown_table_alignments(data_rows[0], len(header_cells))
+        data_rows = data_rows[1:]
+
+    column_count = max([len(header_cells)] + [len(row) for row in data_rows] or [len(header_cells)])
+    if column_count == 0:
+        return None
+
+    def padded(row: list[str]) -> list[str]:
+        return row + ([""] * (column_count - len(row)))
+
+    available_width = PAGE_W - (MARKDOWN_MARGIN * 2)
+    col_widths = [available_width / column_count] * column_count
+
+    table_data: list[list[Any]] = []
+    header_row = []
+    for cell in padded(header_cells):
+        cell_text = normalize_markdown_inline(cell) or " "
+        header_row.append(markdown_paragraph(cell_text, styles["table_header"], bold=True))
+    table_data.append(header_row)
+
+    for row in data_rows:
+        body_row = []
+        for cell in padded(row):
+            cell_text = normalize_markdown_inline(cell) or " "
+            body_row.append(markdown_paragraph(cell_text, styles["table_cell"]))
+        table_data.append(body_row)
+
+    table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    table_style_commands: list[tuple[Any, ...]] = [
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F3F4F6")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#B8BCC2")),
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#9AA0A6")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]
+    for index, alignment in enumerate(alignments):
+        table_style_commands.append(("ALIGN", (index, 0), (index, -1), alignment))
+    table.setStyle(TableStyle(table_style_commands))
+    return table
+
+
+def build_markdown_story(markdown_text: str) -> list[Any]:
+    styles = build_markdown_styles()
+    story: list[Any] = []
+    paragraph_lines: list[str] = []
+    lines = nfc(markdown_text.replace("\r\n", "\n").replace("\r", "\n")).split("\n")
+    index = 0
+
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+
+        if re.match(r"^(```+|~~~+)", stripped):
+            append_markdown_paragraph(story, paragraph_lines, styles["body"])
+            fence = stripped[:3]
+            index += 1
+            code_lines: list[str] = []
+            while index < len(lines) and not lines[index].strip().startswith(fence):
+                code_lines.append(lines[index])
+                index += 1
+            story.append(Preformatted("\n".join(code_lines) or " ", styles["code"]))
+            index += 1
+            continue
+
+        if stripped == "":
+            append_markdown_paragraph(story, paragraph_lines, styles["body"])
+            index += 1
+            continue
+
+        heading_match = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading_match:
+            append_markdown_paragraph(story, paragraph_lines, styles["body"])
+            level = len(heading_match.group(1))
+            heading_text = normalize_markdown_inline(heading_match.group(2))
+            story.append(markdown_paragraph(heading_text or " ", styles[f"h{level}"], bold=True))
+            index += 1
+            continue
+
+        if re.fullmatch(r"(\*\s*){3,}|(-\s*){3,}|(_\s*){3,}", stripped):
+            append_markdown_paragraph(story, paragraph_lines, styles["body"])
+            story.append(Spacer(1, 12))
+            index += 1
+            continue
+
+        if stripped.startswith(">"):
+            append_markdown_paragraph(story, paragraph_lines, styles["body"])
+            quote_lines: list[str] = []
+            while index < len(lines) and lines[index].strip().startswith(">"):
+                quote_lines.append(lines[index].strip()[1:].strip())
+                index += 1
+            quote_text = normalize_markdown_inline(" ".join(quote_lines))
+            if quote_text:
+                story.append(markdown_paragraph(quote_text, styles["quote"]))
+            continue
+
+        list_match = re.match(r"^([-*+])\s+(.*)$", stripped)
+        ordered_match = re.match(r"^(\d+)[\.\)]\s+(.*)$", stripped)
+        if list_match or ordered_match:
+            append_markdown_paragraph(story, paragraph_lines, styles["body"])
+            while index < len(lines):
+                current = lines[index].strip()
+                bullet_match = re.match(r"^([-*+])\s+(.*)$", current)
+                number_match = re.match(r"^(\d+)[\.\)]\s+(.*)$", current)
+                if not bullet_match and not number_match:
+                    break
+                if bullet_match:
+                    item_text = f"• {normalize_markdown_inline(bullet_match.group(2))}"
+                else:
+                    item_text = f"{number_match.group(1)}. {normalize_markdown_inline(number_match.group(2))}"
+                story.append(markdown_paragraph(item_text, styles["bullet"]))
+                index += 1
+            continue
+
+        if stripped.startswith("|") and "|" in stripped[1:]:
+            append_markdown_paragraph(story, paragraph_lines, styles["body"])
+            table_lines: list[str] = []
+            while index < len(lines):
+                current = lines[index].rstrip()
+                if not current.strip().startswith("|"):
+                    break
+                table_lines.append(current)
+                index += 1
+            table = build_markdown_table(table_lines, styles)
+            if table is not None:
+                story.append(table)
+                story.append(Spacer(1, 8))
+            else:
+                story.append(Preformatted("\n".join(table_lines), styles["code"]))
+            continue
+
+        paragraph_lines.append(line)
+        index += 1
+
+    append_markdown_paragraph(story, paragraph_lines, styles["body"])
+    if not story:
+        story.append(markdown_paragraph("(빈 마크다운 파일)", styles["body"]))
+    return story
+
+
+def convert_markdown_to_pdf(input_path: Path, output_pdf: Path, source_label: str | None = None) -> Path:
+    markdown_text = read_text_file(input_path).strip("\ufeff")
+    output_pdf.parent.mkdir(parents=True, exist_ok=True)
+    document = SimpleDocTemplate(
+        str(output_pdf),
+        pagesize=A4,
+        leftMargin=MARKDOWN_MARGIN,
+        rightMargin=MARKDOWN_MARGIN,
+        topMargin=MARKDOWN_MARGIN,
+        bottomMargin=MARKDOWN_MARGIN,
+    )
+    document.build(build_markdown_story(markdown_text))
+    return output_pdf
+
+
 def normalize_prompt_path(raw: str) -> str:
     cleaned = raw.strip()
     for prefix in ("source ", "cd ", "open "):
@@ -337,6 +729,20 @@ def prompt_path(
         return candidate
 
 
+def prompt_yes_no(prompt: str, default: bool = True) -> bool:
+    default_hint = "y" if default else "n"
+    while True:
+        raw = input(f"{prompt} [Enter={default_hint}, y/n]: ").strip()
+        normalized = normalize_prompt_path(raw).lower()
+        if normalized == "":
+            return default
+        if normalized in {"y", "yes"}:
+            return True
+        if normalized in {"n", "no"}:
+            return False
+        print("y 또는 n 으로 입력해 주세요.")
+
+
 def prompt_split_size_mb(default_mb: float = DEFAULT_SPLIT_SIZE_MB) -> float | None:
     while True:
         raw = input(
@@ -362,7 +768,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         type=Path,
         default=None,
-        help="PDF 저장 폴더. 기본값은 ~/Documents",
+        help="PDF 저장 폴더. 파일 입력 시 해당 파일 폴더, 폴더 입력 시 ~/Downloads",
     )
     parser.add_argument(
         "--credentials",
@@ -380,6 +786,11 @@ def parse_args() -> argparse.Namespace:
         "--date",
         default=datetime.now().strftime("%y%m%d"),
         help="출력 파일 날짜 문자열(yymmdd). 기본값은 오늘",
+    )
+    parser.add_argument(
+        "--include-subfolders",
+        default=None,
+        help="폴더 입력 시 하위폴더 포함 여부. y/yes 또는 n/no",
     )
     parser.add_argument(
         "--split-size-mb",
@@ -446,8 +857,20 @@ def collect_immediate_subfolders(root: Path) -> list[Path]:
     )
 
 
-def collect_supported_files(subfolder: Path, output_dir: Path) -> list[Path]:
+def collect_supported_files(subfolder: Path, output_dir: Path, recursive: bool = True) -> list[Path]:
     files: list[Path] = []
+    if not recursive:
+        for path in sorted(subfolder.iterdir(), key=lambda item: item.name.lower()):
+            if path.is_dir():
+                continue
+            if is_excluded_name(path.name):
+                continue
+            if is_relative_to(path, output_dir):
+                continue
+            if path.suffix.lower() in SUPPORTED_EXTS:
+                files.append(path)
+        return files
+
     for current_root, dirnames, filenames in os.walk(subfolder):
         current_root_path = Path(current_root)
         dirnames[:] = sorted(
@@ -760,6 +1183,12 @@ def convert_source_to_pdf(
     ext = source_path.suffix.lower()
     if ext in PDF_EXTS:
         return source_path
+    if ext in MARKDOWN_EXTS:
+        return convert_markdown_to_pdf(
+            source_path,
+            build_temp_pdf_path(work_dir, source_path),
+            source_label=source_label,
+        )
     if ext in TEXT_EXTS:
         return convert_text_to_pdf(
             source_path,
@@ -776,15 +1205,16 @@ def convert_source_to_pdf(
     raise RuntimeError(f"지원되지 않는 확장자입니다: {source_path.suffix}")
 
 
-def build_subfolder_pdf(
-    root: Path,
-    subfolder: Path,
+def build_folder_pdf_result(
+    display_name: str,
+    source_label_prefix: str,
+    source_folder: Path,
+    output_pdf: Path,
     output_dir: Path,
-    date_str: str,
+    recursive: bool,
     google_exporter: GoogleExporter | None,
 ) -> FolderResult:
-    source_files = collect_supported_files(subfolder, output_dir)
-    output_pdf = output_dir / build_output_name(date_str, root.name, subfolder.name)
+    source_files = collect_supported_files(source_folder, output_dir, recursive=recursive)
     success_count = 0
     failure_count = 0
     writer = PdfWriter()
@@ -794,18 +1224,18 @@ def build_subfolder_pdf(
 
         if not source_files:
             notice_pdf = temp_root_path / "empty.pdf"
-            source_label = nfc(f"{root.name}/{subfolder.name}")
+            source_label = nfc(source_label_prefix)
             render_notice_pdf(
                 notice_pdf,
-                f"{subfolder.name}",
+                f"{display_name}",
                 "지원되는 파일이 없어 안내 페이지만 생성했습니다.",
                 source_label=source_label,
             )
             append_pdf_to_writer(writer, notice_pdf, source_label=source_label)
         else:
             for index, source_file in enumerate(source_files, start=1):
-                relative_path = source_file.relative_to(subfolder)
-                source_label = nfc(f"{root.name}/{subfolder.name}/{relative_path.as_posix()}")
+                relative_path = source_file.relative_to(source_folder)
+                source_label = nfc(f"{source_label_prefix}/{relative_path.as_posix()}")
                 work_dir = temp_root_path / f"{index:04d}"
                 work_dir.mkdir(parents=True, exist_ok=True)
                 try:
@@ -821,7 +1251,7 @@ def build_subfolder_pdf(
                         source_label=source_label,
                     )
                     success_count += 1
-                    print(f"OK\t{subfolder.name}\t{relative_path}")
+                    print(f"OK\t{display_name}\t{relative_path}")
                 except Exception as exc:  # pragma: no cover - runtime/file dependent
                     failure_count += 1
                     notice_pdf = work_dir / "failed.pdf"
@@ -832,17 +1262,36 @@ def build_subfolder_pdf(
                         source_label=source_label,
                     )
                     append_pdf_to_writer(writer, notice_pdf, source_label=source_label)
-                    print(f"FAIL\t{subfolder.name}\t{relative_path}\t{type(exc).__name__}: {exc}")
+                    print(f"FAIL\t{display_name}\t{relative_path}\t{type(exc).__name__}: {exc}")
 
         cleanup_split_artifacts(output_pdf)
         save_writer(writer, output_pdf)
 
     return FolderResult(
-        subfolder=subfolder,
+        subfolder=source_folder,
         output_pdf=output_pdf,
         source_count=len(source_files),
         success_count=success_count,
         failure_count=failure_count,
+    )
+
+
+def build_subfolder_pdf(
+    root: Path,
+    subfolder: Path,
+    output_dir: Path,
+    date_str: str,
+    google_exporter: GoogleExporter | None,
+) -> FolderResult:
+    output_pdf = output_dir / build_output_name(date_str, root.name, subfolder.name)
+    return build_folder_pdf_result(
+        display_name=subfolder.name,
+        source_label_prefix=f"{root.name}/{subfolder.name}",
+        source_folder=subfolder,
+        output_pdf=output_pdf,
+        output_dir=output_dir,
+        recursive=True,
+        google_exporter=google_exporter,
     )
 
 
@@ -885,9 +1334,13 @@ def build_single_file_pdf(
     return output_pdf
 
 
-def has_google_shortcuts(subfolders: list[Path], output_dir: Path) -> bool:
+def has_google_files(files: list[Path]) -> bool:
+    return any(source_file.suffix.lower() in GOOGLE_EXTS for source_file in files)
+
+
+def has_google_shortcuts(subfolders: list[Path], output_dir: Path, recursive: bool = True) -> bool:
     for subfolder in subfolders:
-        for source_file in collect_supported_files(subfolder, output_dir):
+        for source_file in collect_supported_files(subfolder, output_dir, recursive=recursive):
             if source_file.suffix.lower() in GOOGLE_EXTS:
                 return True
     return False
@@ -899,7 +1352,7 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path | None, Pa
     if args.root is not None:
         root = args.root.expanduser().resolve()
     elif interactive:
-        root = prompt_path("PDF로 변환할 파일들이 있는 상위폴더 또는 파일 경로", must_exist=True)
+        root = prompt_path("PDF로 변환할 대상 파일 또는 폴더 경로", must_exist=True)
     else:
         raise RuntimeError("--root 가 필요합니다.")
 
@@ -908,7 +1361,7 @@ def resolve_paths(args: argparse.Namespace) -> tuple[Path, Path, Path | None, Pa
     if not root.is_dir() and not root.is_file():
         raise RuntimeError(f"폴더 또는 파일 경로를 입력해 주세요: {root}")
 
-    default_output = Path.home() / "Documents"
+    default_output = root.parent if root.is_file() else (Path.home() / "Downloads")
     if args.output_dir is not None:
         output_dir = args.output_dir.expanduser().resolve()
     elif interactive:
@@ -940,6 +1393,21 @@ def resolve_split_size_mb(args: argparse.Namespace, interactive: bool) -> float 
     return DEFAULT_SPLIT_SIZE_MB
 
 
+def resolve_include_subfolders(args: argparse.Namespace, root: Path, interactive: bool) -> bool:
+    if not root.is_dir():
+        return False
+    if args.include_subfolders is not None:
+        normalized = normalize_prompt_path(str(args.include_subfolders)).lower()
+        if normalized in {"", "y", "yes"}:
+            return True
+        if normalized in {"n", "no"}:
+            return False
+        raise ValueError("--include-subfolders 는 y/yes 또는 n/no 이어야 합니다.")
+    if interactive:
+        return prompt_yes_no("하위폴더를 포함할까요?", default=True)
+    return True
+
+
 def maybe_prompt_credentials(
     credentials_path: Path | None,
     interactive: bool,
@@ -963,7 +1431,7 @@ def maybe_prompt_credentials(
     return Path(response).expanduser().resolve()
 
 
-def print_summary(results: list[FolderResult], aggregate_pdf: Path) -> None:
+def print_summary(results: list[FolderResult], aggregate_pdf: Path | None = None) -> None:
     print("\nSUMMARY")
     for result in results:
         split_suffix = ""
@@ -977,7 +1445,8 @@ def print_summary(results: list[FolderResult], aggregate_pdf: Path) -> None:
             f"-> {result.output_pdf.name}"
             f"{split_suffix}"
         )
-    print(f"AGG\t{aggregate_pdf.name}")
+    if aggregate_pdf is not None:
+        print(f"AGG\t{aggregate_pdf.name}")
 
 
 def apply_optional_splits(results: list[FolderResult], aggregate_pdf: Path, split_size_mb: float | None) -> list[Path]:
@@ -1000,6 +1469,7 @@ def main() -> int:
         root, output_dir, credentials_path, token_path = resolve_paths(args)
         log_path = build_log_path(output_dir, date_str, root.name)
         interactive = not args.non_interactive and sys.stdin.isatty()
+        include_subfolders = resolve_include_subfolders(args, root, interactive)
         split_size_mb = resolve_split_size_mb(args, interactive)
 
         with tee_output(log_path):
@@ -1035,11 +1505,16 @@ def main() -> int:
                 print(f"FILE\t{root.name}\t-> {output_pdf.name}")
                 return 0
 
-            subfolders = collect_immediate_subfolders(root)
-            if not subfolders:
-                raise RuntimeError(f"직속 하위폴더가 없습니다: {root}")
-
-            needs_google = has_google_shortcuts(subfolders, output_dir)
+            subfolders = collect_immediate_subfolders(root) if include_subfolders else []
+            direct_root_files = collect_supported_files(root, output_dir, recursive=False)
+            folder_mode = include_subfolders and bool(subfolders)
+            needs_google = has_google_files(direct_root_files)
+            if folder_mode:
+                needs_google = needs_google or has_google_shortcuts(subfolders, output_dir, recursive=True)
+            else:
+                needs_google = needs_google or has_google_files(
+                    collect_supported_files(root, output_dir, recursive=include_subfolders)
+                )
 
             google_exporter: GoogleExporter | None = None
             if needs_google:
@@ -1051,15 +1526,54 @@ def main() -> int:
                 )
 
             results: list[FolderResult] = []
-            for subfolder in subfolders:
-                result = build_subfolder_pdf(
-                    root,
-                    subfolder,
-                    output_dir,
-                    date_str,
-                    google_exporter,
+            if folder_mode and direct_root_files:
+                root_output_pdf = output_dir / build_output_name(date_str, root.name, "root")
+                results.append(
+                    build_folder_pdf_result(
+                        display_name="root",
+                        source_label_prefix=root.name,
+                        source_folder=root,
+                        output_pdf=root_output_pdf,
+                        output_dir=output_dir,
+                        recursive=False,
+                        google_exporter=google_exporter,
+                    )
+                )
+            if folder_mode:
+                for subfolder in subfolders:
+                    result = build_subfolder_pdf(
+                        root,
+                        subfolder,
+                        output_dir,
+                        date_str,
+                        google_exporter,
+                    )
+                    results.append(result)
+            else:
+                single_output_pdf = output_dir / build_output_name(date_str, root.name, "root")
+                result = build_folder_pdf_result(
+                    display_name=root.name,
+                    source_label_prefix=root.name,
+                    source_folder=root,
+                    output_pdf=single_output_pdf,
+                    output_dir=output_dir,
+                    recursive=include_subfolders,
+                    google_exporter=google_exporter,
                 )
                 results.append(result)
+
+            if len(results) == 1:
+                result = results[0]
+                if split_size_mb is not None:
+                    result.split_pdfs = split_pdf_by_size(result.output_pdf, max_size_mb=split_size_mb)
+                print(f"OK\t{root.name}\t-> {result.output_pdf.name}")
+                if result.split_pdfs:
+                    print(
+                        f"SPLIT\t{result.output_pdf.name}\t"
+                        f"{', '.join(path.name for path in result.split_pdfs)}"
+                    )
+                print_summary(results)
+                return 1 if result.failure_count else 0
 
             aggregate_pdf = output_dir / build_output_name(date_str, root.name, "agg")
             aggregate_pdf = build_aggregate_pdf(results, aggregate_pdf)
